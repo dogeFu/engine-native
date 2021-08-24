@@ -33,6 +33,7 @@
     #include "../Value.h"
     #include "Base.h"
 
+    #include <memory>
     #include <thread>
 
     #if SE_ENABLE_INSPECTOR
@@ -70,6 +71,8 @@ public:
 private:
     v8::HandleScope _handleScope;
 };
+
+class EsEnvironment;
 
 /**
      * ScriptEngine is a sington which represents a context of JavaScript VM.
@@ -229,6 +232,10 @@ public:
          */
     bool runScript(const std::string &path, Value *ret = nullptr);
 
+    bool import(const std::string &specifier_, std::string *parentURL);
+
+    void runInInternal(const std::string &path_);
+
     /**
          *  @brief Tests whether script engine is doing garbage collection.
          *  @return true if it's in garbage collection, otherwise false.
@@ -367,6 +374,8 @@ private:
     bool _isGarbageCollecting;
     bool _isInCleanup;
     bool _isErrorHandleWorking;
+
+    std::unique_ptr<EsEnvironment> _environment;
 };
 
 } // namespace se

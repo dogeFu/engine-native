@@ -145,5 +145,6 @@ function(cc_win32_definations target)
         _SCL_SECURE_NO_WARNINGS
         _USRLIBSIMSTATIC
         SE_ENABLE_INSPECTOR
+        _ITERATOR_DEBUG_LEVEL=0
     )
 endfunction()

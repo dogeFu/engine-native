@@ -34,6 +34,7 @@
     #include "Utils.h"
     #include "platform/FileUtils.h"
 
+    #include <array>
     #include <sstream>
 
     #if SE_ENABLE_INSPECTOR
@@ -60,6 +61,949 @@ std::map<std::string, unsigned> jsbFunctionInvokedRecords;
 namespace se {
 
 Class *__jsb_CCPrivateData_class = nullptr; //NOLINT(readability-identifier-naming)
+
+class EsModule;
+
+class InternalBindingFunction {
+public:
+    InternalBindingFunction(v8::Local<v8::Context> context_) {
+        const auto isolate  = context_->GetIsolate();
+        const auto external = v8::External::New(isolate, this);
+        const auto maybeFn  = v8::Function::New(
+            context_,
+            &Call,
+            external,
+            1);
+        assert(!maybeFn.IsEmpty());
+        v8::Local<v8::Function> fn;
+        maybeFn.ToLocal(&fn);
+        _fn.Reset(isolate, fn);
+    }
+
+    InternalBindingFunction(const InternalBindingFunction &) = delete;
+
+    InternalBindingFunction(InternalBindingFunction &&) = delete;
+
+    v8::Local<v8::Function> fn(v8::Isolate &isolate_) {
+        return _fn.Get(&isolate_);
+    }
+
+    void add(const std::string &id_, v8::Local<v8::Value> value_, v8::Isolate *isolate_) {
+        _bindings[id_].Reset(isolate_, value_);
+    }
+
+private:
+    /// <summary>
+    /// internalBinding(id: string): unknown
+    /// </summary>
+    /// <param name="args_"></param>
+    static void Call(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        assert(args_.Data()->IsExternal());
+        const auto external        = args_.Data().As<v8::External>();
+        const auto internalBinding = reinterpret_cast<const InternalBindingFunction *>(external->Value());
+        internalBinding->_call(args_);
+    }
+
+    v8::Persistent<v8::Function> _fn;
+
+    std::map<std::string, v8::Persistent<v8::Value>> _bindings;
+
+    void _call(const v8::FunctionCallbackInfo<v8::Value> &args_) const {
+        const auto isolate = args_.GetIsolate();
+
+        assert(args_.Length() == 1);
+
+        assert(args_[0]->IsString());
+        const auto id = v8::String::Utf8Value{isolate, args_[0].As<v8::String>()};
+
+        const auto rBinding = _bindings.find(*id);
+        if (rBinding == _bindings.end()) {
+            std::ostringstream errMsg;
+            errMsg << u8R"("Unknown internal binding: ")" << *id;
+            isolate->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8(isolate, errMsg.str().c_str()).ToLocalChecked()));
+            args_.GetReturnValue().SetUndefined();
+            return;
+        }
+
+        const auto &[_, binding] = *rBinding;
+        args_.GetReturnValue().Set(binding.Get(isolate));
+    }
+};
+
+class InternalBindingModule {
+public:
+    InternalBindingModule(
+        v8::Local<v8::Context> context_, v8::Local<v8::Function> module_wrap_constructor_) : _internalBindings(context_) {
+        auto isolate = context_->GetIsolate();
+
+        const auto internalBindingExportName =
+            v8::String::NewFromUtf8(isolate, exportNameInternalBinding).ToLocalChecked();
+        std::vector<v8::Local<v8::Value>> exportNames{internalBindingExportName};
+
+        const auto syntheticExecution =
+            v8::Function::New(
+                context_,
+                [](const v8::FunctionCallbackInfo<v8::Value> &args_) {
+                    assert(args_.Data()->IsExternal());
+                    reinterpret_cast<InternalBindingModule *>(args_.Data().As<v8::External>()->Value())->_evaluate(args_);
+                },
+                v8::External::New(isolate, this))
+                .ToLocalChecked();
+
+        std::array<v8::Local<v8::Value>, 3> args{
+            v8::String::NewFromUtf8(isolate, "internal_binding").ToLocalChecked(), // url
+            v8::Array::New(isolate, exportNames.data(), exportNames.size()),       // exportNames
+            syntheticExecution,                                                    // syntheticExecutionFunction
+        };
+        const auto moduleWrap = module_wrap_constructor_->CallAsConstructor(
+                                                            context_,
+                                                            args.size(),
+                                                            args.data())
+                                    .ToLocalChecked()
+                                    .As<v8::Object>();
+        this->_moduleWrap.Reset(isolate, moduleWrap);
+    }
+
+    InternalBindingModule(const InternalBindingModule &) = delete;
+
+    InternalBindingModule(InternalBindingModule &&) = delete;
+
+    v8::Local<v8::Object> module(v8::Isolate *isolate_) {
+        return this->_moduleWrap.Get(isolate_);
+    }
+
+    InternalBindingFunction &bindings() {
+        return _internalBindings;
+    }
+
+private:
+    static constexpr auto exportNameInternalBinding = "internalBinding";
+
+    v8::Persistent<v8::Object> _moduleWrap;
+
+    InternalBindingFunction _internalBindings;
+
+    void _evaluate(
+        const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        auto       isolate                    = args_.GetIsolate();
+        const auto context                    = isolate->GetCurrentContext();
+        const auto moduleWrapJs               = args_.This();
+        const auto setSyntheticModuleExportJs = moduleWrapJs->Get(
+                                                                context,
+                                                                v8::String::NewFromUtf8(isolate, u8R"(setSyntheticModuleExport)").ToLocalChecked())
+                                                    .ToLocalChecked()
+                                                    .As<v8::Function>();
+
+        std::array<v8::Local<v8::Value>, 2> args{
+            v8::String::NewFromUtf8(isolate, exportNameInternalBinding).ToLocalChecked(),
+            _internalBindings.fn(*isolate)};
+        setSyntheticModuleExportJs->CallAsFunction(
+            context,
+            moduleWrapJs,
+            args.size(),
+            args.data());
+    }
+};
+
+enum ContextEmbedderIndex {
+    environment = 32 + 10,
+};
+
+class EsEnvironment {
+public:
+    EsEnvironment(v8::Local<v8::Context> context_);
+
+    EsEnvironment(const EsEnvironment &) = delete;
+
+    EsEnvironment(EsEnvironment &&) = delete;
+
+    v8::Local<v8::Context> context() {
+        return _context.Get(_isolate);
+    }
+
+    v8::Local<v8::FunctionTemplate> createFunctionTemplate(
+        v8::FunctionCallback     callback_,
+        v8::Local<v8::Signature> signature_        = v8::Local<v8::Signature>(),
+        v8::ConstructorBehavior  behavior_         = v8::ConstructorBehavior::kAllow,
+        v8::SideEffectType       side_effect_type_ = v8::SideEffectType::kHasSideEffect) {
+        v8::Local<v8::External> external = _external.Get(isolate());
+        return v8::FunctionTemplate::New(
+            _isolate,
+            callback_,
+            external,
+            signature_,
+            0,
+            behavior_,
+            side_effect_type_);
+    }
+
+    void SetMethod(v8::Local<v8::Object> that,
+                   const char *          name,
+                   v8::FunctionCallback  callback) {
+        v8::Local<v8::Context>  context = isolate()->GetCurrentContext();
+        v8::Local<v8::Function> function =
+            createFunctionTemplate(callback, v8::Local<v8::Signature>(),
+                                   // TODO(TimothyGu): Investigate if SetMethod is ever
+                                   // used for constructors.
+                                   v8::ConstructorBehavior::kAllow,
+                                   v8::SideEffectType::kHasSideEffect)
+                ->GetFunction(context)
+                .ToLocalChecked();
+        // kInternalized strings are created in the old space.
+        const v8::NewStringType type = v8::NewStringType::kInternalized;
+        v8::Local<v8::String>   name_string =
+            v8::String::NewFromUtf8(isolate(), name, type).ToLocalChecked();
+        that->Set(context, name_string, function).FromJust();
+        function->SetName(name_string); // NODE_SET_METHOD() compatibility.
+    }
+
+    void SetProtoMethod(
+        v8::Local<v8::FunctionTemplate> templ_,
+        const char *                    name_,
+        v8::FunctionCallback            callback_) {
+        v8::Local<v8::Signature>        signature = v8::Signature::New(isolate(), templ_);
+        v8::Local<v8::FunctionTemplate> t =
+            createFunctionTemplate(callback_, signature, v8::ConstructorBehavior::kThrow,
+                                   v8::SideEffectType::kHasSideEffect);
+        // kInternalized strings are created in the old space.
+        const v8::NewStringType type = v8::NewStringType::kInternalized;
+        v8::Local<v8::String>   name_string =
+            v8::String::NewFromUtf8(isolate(), name_, type).ToLocalChecked();
+        templ_->PrototypeTemplate()->Set(name_string, t);
+        t->SetClassName(name_string); // NODE_SET_PROTOTYPE_METHOD() compatibility.
+    }
+
+    void SetProtoMethodNoSideEffect(
+        v8::Local<v8::FunctionTemplate> templ_,
+        const char *                    name_,
+        v8::FunctionCallback            callback_) {
+        v8::Local<v8::Signature>        signature = v8::Signature::New(isolate(), templ_);
+        v8::Local<v8::FunctionTemplate> t =
+            createFunctionTemplate(callback_, signature, v8::ConstructorBehavior::kThrow,
+                                   v8::SideEffectType::kHasNoSideEffect);
+        // kInternalized strings are created in the old space.
+        const v8::NewStringType type = v8::NewStringType::kInternalized;
+        v8::Local<v8::String>   name_string =
+            v8::String::NewFromUtf8(isolate(), name_, type).ToLocalChecked();
+        templ_->PrototypeTemplate()->Set(name_string, t);
+        t->SetClassName(name_string); // NODE_SET_PROTOTYPE_METHOD() compatibility.
+    }
+
+    void SetMethodNoSideEffect(v8::Local<v8::Object> templ_,
+                               const char *          name_,
+                               v8::FunctionCallback  callback) {
+        v8::Local<v8::Context>  context = isolate()->GetCurrentContext();
+        v8::Local<v8::Function> function =
+            createFunctionTemplate(callback, v8::Local<v8::Signature>(),
+                                   // TODO(TimothyGu): Investigate if SetMethod is ever
+                                   // used for constructors.
+                                   v8::ConstructorBehavior::kAllow,
+                                   v8::SideEffectType::kHasNoSideEffect)
+                ->GetFunction(context)
+                .ToLocalChecked();
+        // kInternalized strings are created in the old space.
+        const v8::NewStringType type = v8::NewStringType::kInternalized;
+        v8::Local<v8::String>   name_string =
+            v8::String::NewFromUtf8(isolate(), name_, type).ToLocalChecked();
+        templ_->Set(context, name_string, function).FromJust();
+        function->SetName(name_string); // NODE_SET_METHOD() compatibility.
+    }
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="message_">UTF-8.</param>
+    void throwError(const char *message_) {
+        throwError(v8::Exception::Error, message_);
+    }
+
+    void throwError(
+        v8::Local<v8::Value> (*constructor_)(v8::Local<v8::String>), const char *message_) {
+        v8::HandleScope handleScope(isolate());
+        (void)isolate()->ThrowException(constructor_(v8::String::NewFromUtf8(_isolate, message_).ToLocalChecked()));
+    }
+
+    void startup();
+
+    ~EsEnvironment() {
+        // TODO: SetAlignedPointerInEmbedderData to nullptr
+    }
+
+    v8::Isolate *isolate() {
+        return _isolate;
+    }
+
+    /*void addCleanUpHook(std::function<void()> callback_) {
+  _cleanupHooks.emplace(callback_);
+}*/
+
+    void registerModuleWrapper(v8::Local<v8::Module> module_, EsModule *wrapper_) {
+        _hashToModuleMap.emplace(module_->GetIdentityHash(), wrapper_);
+    }
+
+    void unregisterModuleWrapper(v8::Local<v8::Module> module_, EsModule *wrapper_) {
+        auto range = _hashToModuleMap.equal_range(module_->GetIdentityHash());
+        for (auto i = range.first; i != range.second; ++i) {
+            if (i->second == wrapper_) {
+                _hashToModuleMap.erase(i);
+                break;
+            }
+        }
+    }
+
+    EsModule *getModuleWrapper(v8::Local<v8::Module> module_);
+
+    void runInInternal(const std::string &path_) {
+        auto isolate = _isolate;
+
+        auto               context = v8::Context::New(isolate);
+        v8::Context::Scope contextScope{context};
+
+        // Creates the global "exports" object.
+        auto exports = v8::Object::New(isolate);
+        context->Global()->Set(
+            context,
+            v8::String::NewFromUtf8(isolate, R"(exports)").ToLocalChecked(),
+            exports);
+
+        // Injects the "internalBindings" global function.
+        context->Global()->Set(
+            context,
+            v8::String::NewFromUtf8(isolate, R"(internalBinding)").ToLocalChecked(),
+            _internalBindingModule->bindings().fn(*isolate));
+
+        const auto data               = v8::External::New(isolate, this);
+        const auto loadInternalSource = v8::Function::New(context, _loadInternalSource, data).ToLocalChecked();
+        context->Global()->Set(
+            context,
+            v8::String::NewFromUtf8(isolate, R"(loadInternalSource)").ToLocalChecked(),
+            loadInternalSource);
+
+        assert(_fileOperationDelegate.isValid());
+        std::string sourceString = _fileOperationDelegate.onGetStringFromFile(path_);
+        const auto  source       = v8::String::NewFromUtf8(isolate, sourceString.c_str()).ToLocalChecked();
+        const auto  maybeScript  = v8::Script::Compile(
+            context,
+            source,
+            nullptr);
+        const auto       lineOffset         = v8::Integer::New(isolate, 0);
+        const auto       columnOffset       = v8::Integer::New(isolate, 0);
+        const auto       hostDefinedOptions = v8::PrimitiveArray::New(isolate, 0);
+        v8::ScriptOrigin origin(
+            v8::String::NewFromUtf8(isolate, path_.c_str()).ToLocalChecked(),
+            lineOffset,
+            columnOffset,
+            v8::False(isolate),       // Is shared cross-origin
+            v8::Local<v8::Integer>(), // Script id
+            v8::Local<v8::Value>(),   // Source map url
+            v8::False(isolate),       // Is opaque
+            v8::False(isolate),       // Is Web assembly module
+            v8::True(isolate),        // Is module,
+            hostDefinedOptions);
+        v8::Local<v8::Script> script;
+        maybeScript.ToLocal(&script);
+        script->Run(context);
+    }
+
+    v8::MaybeLocal<v8::Value> import(v8::Local<v8::String> specifier_, v8::MaybeLocal<v8::String> url_) {
+        auto                 isolate           = _isolate;
+        auto                 context           = _context.Get(isolate);
+        const auto           loader            = _loader.Get(isolate);
+        const auto           maybeImportMethod = loader->Get(context, v8::String::NewFromUtf8(isolate, "import").ToLocalChecked());
+        v8::Local<v8::Value> importMethod;
+        maybeImportMethod.ToLocal(&importMethod);
+        std::array<v8::Local<v8::Value>, 2> args = {specifier_, url_.FromMaybe(v8::Undefined(isolate))};
+        return importMethod.As<v8::Function>()->CallAsFunction(context, loader, args.size(), args.data());
+    }
+
+    static EsEnvironment *get(v8::Isolate *isolate_) {
+        return get(isolate_->GetCurrentContext());
+    }
+
+    static EsEnvironment *get(v8::Local<v8::Context> context_) {
+        return static_cast<EsEnvironment *>(
+            context_->GetAlignedPointerFromEmbedderData(ContextEmbedderIndex::environment));
+    }
+
+    static EsEnvironment *get(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        assert(args_.Data()->IsExternal());
+        return static_cast<EsEnvironment *>(args_.Data().As<v8::External>()->Value());
+    }
+
+    ScriptEngine::FileOperationDelegate _fileOperationDelegate;
+
+private:
+    v8::Isolate *                                 _isolate;
+    v8::Persistent<v8::Context>                   _context;
+    v8::Persistent<v8::External>                  _external;
+    std::unordered_map<std::uint32_t, EsModule *> _hashToModuleMap;
+    //std::unordered_set<std::function<void()>> _cleanupHooks; // TODO: clean
+    v8::Persistent<v8::Function>           _promiseRejectCallback;
+    std::unique_ptr<InternalBindingModule> _internalBindingModule;
+    v8::Persistent<v8::FunctionTemplate>   _moduleWrapTempl;
+    v8::Persistent<v8::Object>             _defaultLoader;
+    v8::Persistent<v8::Object>             _loader;
+
+    static void _onPromiseRejected(v8::PromiseRejectMessage message_) {
+        auto promise = message_.GetPromise();
+        auto isolate = promise->GetIsolate();
+        auto event   = message_.GetEvent();
+
+        auto env = EsEnvironment::get(isolate);
+        if (env == nullptr) {
+            return;
+        }
+
+        if (env->_promiseRejectCallback.IsEmpty()) {
+            return;
+        }
+
+        v8::Local<v8::Value> value;
+
+        switch (message_.GetEvent()) {
+            case v8::PromiseRejectEvent::kPromiseRejectWithNoHandler:
+                value = message_.GetValue();
+                break;
+
+            case v8::PromiseRejectEvent::kPromiseHandlerAddedAfterReject:
+                break;
+
+            case v8::PromiseRejectEvent::kPromiseRejectAfterResolved:
+                break;
+
+            case v8::PromiseRejectEvent::kPromiseResolveAfterResolved:
+                break;
+
+            default:
+                assert(false || "Unreachable.");
+                break;
+        }
+
+        if (value.IsEmpty()) {
+            value = v8::Undefined(isolate);
+        }
+
+        std::array<v8::Local<v8::Value>, 3> args = {
+            promise,
+            v8::Number::New(isolate, event),
+            value};
+        env->_promiseRejectCallback.Get(isolate)->Call(
+            env->context(), v8::Undefined(isolate), args.size(), args.data());
+    }
+
+    static void _handleException(EsEnvironment *env_, v8::Local<v8::Value> exception_) {
+        const auto context = env_->context();
+        const auto isolate = env_->isolate();
+        /*auto global = context->Global();
+    auto console = global->Get(v8::String::NewFromUtf8(isolate, "console")).As<v8::Object>();
+    auto error = console->Get(v8::String::NewFromUtf8(isolate, "error")).As<v8::Function>();
+    v8::Local<v8::Value> ret;
+    error->Call(context, console, 1, &exception_);*/
+        if (exception_->IsObject()) {
+            const auto maybeMessage = exception_.As<v8::Object>()->Get(context, v8::String::NewFromUtf8(isolate, "message").ToLocalChecked());
+            if (!maybeMessage.IsEmpty()) {
+                v8::Local<v8::Value> message;
+                maybeMessage.ToLocal(&message);
+                if (message->IsString()) {
+                    const auto            messageText = message.As<v8::String>();
+                    v8::String::Utf8Value messageTextU8(isolate, messageText);
+                    std::string           messageTextNative(*messageTextU8, messageTextU8.length());
+                    SE_LOGE("%s", messageTextNative.c_str());
+                }
+            }
+        }
+    }
+
+    static void SetPromiseRejectCallback(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        auto env = EsEnvironment::get(args_);
+
+        assert(args_[0]->IsFunction());
+        env->_promiseRejectCallback.Reset(env->_isolate, args_[0].As<v8::Function>());
+    }
+
+    static void _loadInternalSource(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        auto isolate = args_.GetIsolate();
+        auto env     = EsEnvironment::get(args_);
+
+        assert(args_.Length() == 1);
+        assert(args_[0]->IsString());
+
+        v8::String::Utf8Value sourceId{isolate, args_[0]};
+        std::string           path   = "libs/" + std::string{*sourceId};
+        const auto            source = env->_fileOperationDelegate.onGetStringFromFile(path);
+        args_.GetReturnValue().Set(v8::String::NewFromUtf8(isolate, source.data()).ToLocalChecked());
+    }
+
+    std::string _loadDefaultLoaderScriptSource(const std::string &path_) {
+        assert(_fileOperationDelegate.isValid());
+
+        std::string scriptBuffer = _fileOperationDelegate.onGetStringFromFile(path_);
+
+        return scriptBuffer;
+    }
+
+    void _setLoader(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        assert(args_.Length() == 1);
+        assert(args_[0]->IsObject());
+        auto loader = v8::Local<v8::Object>::Cast(args_[0]);
+        _loader.Reset(_isolate, loader);
+    }
+};
+
+class EsObject {
+public:
+    EsObject(EsEnvironment *       env_,
+             v8::Local<v8::Object> object_) : _env(env_), _handle(env_->isolate(), object_) {
+        assert(!object_.IsEmpty());
+        assert(object_->InternalFieldCount() > 0);
+        object_->SetAlignedPointerInInternalField(0, static_cast<void *>(this));
+    }
+
+    ~EsObject() {
+        if (_handle.IsEmpty()) {
+            return;
+        }
+
+        v8::HandleScope handleScope(_env->isolate());
+        object()->SetAlignedPointerInInternalField(0, nullptr);
+    }
+
+    EsEnvironment *env() {
+        return _env;
+    }
+
+    v8::Local<v8::Object> object() {
+        return _handle.Get(_env->isolate());
+    }
+
+    static EsObject *unwrap(v8::Local<v8::Object> object_) {
+        assert(object_->InternalFieldCount() > 0);
+        return static_cast<EsObject *>(object_->GetAlignedPointerFromInternalField(0));
+    }
+
+    template <typename Derived>
+    static Derived *unwrap(v8::Local<v8::Object> object_) {
+        return static_cast<Derived *>(unwrap(object_));
+    }
+
+private:
+    EsEnvironment *            _env;
+    v8::Persistent<v8::Object> _handle;
+};
+
+class EsModule : public EsObject {
+public:
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="env_"></param>
+    /// <param name="object_">The Module `this` object.</param>
+    /// <param name="module_">The v8 module object.</param>
+    /// <param name="url_">The url of the module.</param>
+    EsModule(EsEnvironment *        env_,
+             v8::Local<v8::Object>  object_,
+             v8::Local<v8::Module>  module_,
+             v8::Local<v8::String>  url_,
+             v8::Local<v8::Context> context_) : EsObject(env_, object_),
+                                                _url(env_->isolate(), url_),
+                                                _module(env_->isolate(), module_),
+                                                _context(env_->isolate(), context_) {
+        env_->registerModuleWrapper(module_, this);
+    }
+
+    ~EsModule() {
+        v8::HandleScope scope(env()->isolate());
+        auto            module = _module.Get(env()->isolate());
+        env()->unregisterModuleWrapper(module, this);
+    }
+
+    v8::Local<v8::Module> module(v8::Isolate *isolate_) {
+        return this->_module.Get(isolate_);
+    }
+
+    v8::Local<v8::String> url() {
+        return _url.Get(env()->isolate());
+    }
+
+    static v8::Local<v8::FunctionTemplate> createFunctionTemplate(EsEnvironment &env_) {
+        const auto isoate = env_.isolate();
+        auto       templ  = env_.createFunctionTemplate(EsModule::New);
+        templ->SetClassName(v8::String::NewFromUtf8(isoate, "EsModule").ToLocalChecked());
+        templ->InstanceTemplate()->SetInternalFieldCount(InternalFieldSlots::count);
+        env_.SetProtoMethod(templ, "link", EsModule::Link);
+        env_.SetProtoMethod(templ, "instantiate", EsModule::Instantiate);
+        env_.SetProtoMethod(templ, "evaluate", EsModule::Evaluate);
+        env_.SetProtoMethod(templ, "setSyntheticModuleExport", EsModule::SetSyntheticModuleExport);
+        env_.SetProtoMethod(templ, "namespace", EsModule::Namespace);
+        return templ;
+    }
+
+private:
+    enum InternalFieldSlots {
+        syntheticEvaluationSteps = 1,
+        count,
+    };
+
+    /// <summary>
+    /// new ModuleWrap(url: string, source: string, lineOffset: number, columnOffset: number)
+    /// new ModuleWrap(url: string, exportNames: string[], syntheticExecutionFunction: Function)
+    /// </summary>
+    /// <param name="args_"></param>
+    static void New(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        assert(args_.IsConstructCall());
+        const auto env     = EsEnvironment::get(args_);
+        const auto isolate = env->isolate();
+
+        const auto jsThis = args_.This();
+
+        const auto argc = args_.Length();
+        assert(argc >= 2);
+
+        assert(args_[0]->IsString());
+        const auto url = args_[0].As<v8::String>();
+
+        v8::Local<v8::Context> context = jsThis->CreationContext();
+
+        v8::Local<v8::Module> module;
+        const auto &          arg1 = args_[1];
+        if (!arg1->IsString()) {
+            assert(arg1->IsArray());
+            assert(args_[2]->IsFunction());
+            const auto                         exportNamesJs = arg1.As<v8::Array>();
+            const auto                         nExportNames  = exportNamesJs->Length();
+            std::vector<v8::Local<v8::String>> exportNames(nExportNames);
+            for (std::remove_const_t<decltype(nExportNames)> iExportName = 0;
+                 iExportName < nExportNames; ++iExportName) {
+                const auto exportNameJs = exportNamesJs->Get(context, iExportName).ToLocalChecked();
+                assert(exportNameJs->IsString());
+                exportNames[iExportName] = exportNameJs.As<v8::String>();
+            }
+            module = v8::Module::CreateSyntheticModule(
+                isolate,
+                url,
+                exportNames,
+                _evaluationSteps);
+            jsThis->SetInternalField(InternalFieldSlots::syntheticEvaluationSteps, args_[2]);
+        } else {
+            const auto sourceText = arg1.As<v8::String>();
+
+            v8::TryCatch tryCatch(isolate);
+
+            const auto lineOffset         = v8::Integer::New(isolate, 0);
+            const auto columnOffset       = v8::Integer::New(isolate, 0);
+            const auto hostDefinedOptions = v8::PrimitiveArray::New(isolate, 0);
+
+            v8::ScriptOrigin origin(
+                url,
+                lineOffset,
+                columnOffset,
+                v8::False(isolate),       // Is shared cross-origin
+                v8::Local<v8::Integer>(), // Script id
+                v8::Local<v8::Value>(),   // Source map url
+                v8::False(isolate),       // Is opaque
+                v8::False(isolate),       // Is Web assembly module
+                v8::True(isolate),        // Is module,
+                hostDefinedOptions);
+            v8::Context::Scope         contextScope(context);
+            v8::ScriptCompiler::Source source(sourceText, origin);
+            if (!v8::ScriptCompiler::CompileModule(isolate, &source).ToLocal(&module)) {
+                assert(tryCatch.HasCaught());
+                assert(!tryCatch.Message().IsEmpty());
+                assert(!tryCatch.Exception().IsEmpty());
+                tryCatch.ReThrow();
+                return;
+            }
+        }
+
+        const auto esModule = new EsModule(env, jsThis, module, url, context);
+        args_.GetReturnValue().Set(jsThis);
+    }
+
+    static void Link(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        const auto env     = EsEnvironment::get(args_);
+        const auto isolate = env->isolate();
+
+        assert(args_.Length() == 1);
+        assert(args_[0]->IsFunction());
+
+        const auto jsThis        = args_.This();
+        const auto moduleWrapped = EsModule::unwrap<EsModule>(jsThis);
+
+        if (moduleWrapped->_linked) {
+            return;
+        }
+        moduleWrapped->_linked = true;
+
+        const auto resolver = args_[0].As<v8::Function>();
+
+        const auto context = moduleWrapped->_context.Get(isolate);
+        const auto module  = moduleWrapped->_module.Get(isolate);
+
+        const auto nModuleRequests = module->GetModuleRequestsLength();
+        auto       resolvePromises = v8::Array::New(isolate, nModuleRequests);
+        for (std::remove_const_t<decltype(nModuleRequests)> iModuleRequest = 0;
+             iModuleRequest < nModuleRequests; ++iModuleRequest) {
+            auto                                moduleRequest   = module->GetModuleRequest(iModuleRequest);
+            std::array<v8::Local<v8::Value>, 1> resolveArgs     = {moduleRequest};
+            auto                                resolverRetvalX = resolver->Call(context, jsThis, resolveArgs.size(), resolveArgs.data());
+            if (resolverRetvalX.IsEmpty()) {
+                // TODO?
+                return;
+            }
+            auto resolvePromiseX = resolverRetvalX.ToLocalChecked();
+            if (!resolvePromiseX->IsPromise()) {
+                // TODO: throw
+            }
+            auto resolvePromise = resolvePromiseX.As<v8::Promise>();
+
+            v8::String::Utf8Value moduleRequestU8(env->isolate(), moduleRequest);
+            std::string           moduleRequestNative(*moduleRequestU8, moduleRequestU8.length());
+            moduleWrapped->_resolvePromises[moduleRequestNative].Reset(env->isolate(), resolvePromise);
+
+            resolvePromises->Set(context, iModuleRequest, resolvePromise).FromJust();
+        }
+
+        args_.GetReturnValue().Set(resolvePromises);
+    }
+
+    static void Instantiate(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        auto env     = EsEnvironment::get(args_);
+        auto isolate = env->isolate();
+
+        auto jsThis        = args_.This();
+        auto moduleWrapped = EsModule::unwrap<EsModule>(jsThis);
+
+        auto context = moduleWrapped->_context.Get(isolate);
+        auto module  = moduleWrapped->_module.Get(isolate);
+
+        v8::TryCatch tryCatch(env->isolate());
+        auto         result = module->InstantiateModule(context, ResolveCallback);
+
+        if (!result.FromMaybe(false)) {
+            assert(tryCatch.HasCaught());
+            assert(!tryCatch.Message().IsEmpty());
+            assert(!tryCatch.Exception().IsEmpty());
+            tryCatch.ReThrow();
+            return;
+        }
+    }
+
+    static void Evaluate(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        auto env     = EsEnvironment::get(args_);
+        auto isolate = env->isolate();
+
+        auto jsThis        = args_.This();
+        auto moduleWrapped = EsModule::unwrap<EsModule>(jsThis);
+
+        seLogE("Evaluating %s\n", *v8::String::Utf8Value(isolate, moduleWrapped->url()));
+
+        auto context = moduleWrapped->_context.Get(isolate);
+        auto module  = moduleWrapped->_module.Get(isolate);
+
+        v8::TryCatch tryCatch(env->isolate());
+
+        auto result = module->Evaluate(context);
+
+        if (tryCatch.HasCaught()) {
+            tryCatch.ReThrow();
+            return;
+        }
+
+        args_.GetReturnValue().Set(result.ToLocalChecked());
+    }
+
+    static void SetSyntheticModuleExport(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        auto env        = EsEnvironment::get(args_);
+        auto isolate    = env->isolate();
+        auto jsThis     = args_.This();
+        auto moduleWrap = EsModule::unwrap<EsModule>(jsThis);
+
+        assert(args_.Length() == 2);
+        assert(args_[0]->IsString());
+
+        const auto exportName  = args_[0].As<v8::String>();
+        const auto exportValue = args_[1];
+        const auto v8Module    = moduleWrap->_module.Get(isolate);
+        v8Module->SetSyntheticModuleExport(exportName, exportValue);
+    }
+
+    static void Namespace(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+        auto env           = EsEnvironment::get(args_);
+        auto isolate       = env->isolate();
+        auto jsThis        = args_.This();
+        auto moduleWrapped = EsModule::unwrap<EsModule>(jsThis);
+        auto module        = moduleWrapped->_module.Get(isolate);
+        args_.GetReturnValue().Set(module->GetModuleNamespace());
+    }
+
+    static v8::MaybeLocal<v8::Module> ResolveCallback(
+        v8::Local<v8::Context> context_,
+        v8::Local<v8::String>  module_request_,
+        v8::Local<v8::Module>  importer_) {
+        auto env     = EsEnvironment::get(context_);
+        auto isolate = env->isolate();
+
+        auto importerWrapper = env->getModuleWrapper(importer_);
+        assert(importerWrapper);
+
+        v8::String::Utf8Value moduleRequestU8(isolate, module_request_);
+        std::string           moduleRequestNative(*moduleRequestU8, moduleRequestU8.length());
+        // TODO: what if same specifier occurs multi times
+        if (importerWrapper->_resolvePromises.count(moduleRequestNative) != 1) {
+            env->throwError(u8"Linking was not performend prior to instantiate.");
+            return {};
+        }
+
+        const auto resolvePromise = importerWrapper->_resolvePromises[moduleRequestNative].Get(isolate);
+        if (resolvePromise->State() != v8::Promise::kFulfilled) {
+            env->throwError(u8"Linking promise was not fulfilled at the moment the module instantiates.");
+            return {};
+        }
+
+        auto resolvedModuleX = resolvePromise->Result();
+        if (resolvedModuleX.IsEmpty() ||
+            !resolvedModuleX->IsObject()) {
+            env->throwError(u8"Linking promise did not result a module object.");
+            return {};
+        }
+
+        auto resolvedModuleWrapped = EsModule::unwrap<EsModule>(resolvedModuleX.As<v8::Object>());
+        if (!resolvedModuleWrapped) {
+            // TODO THROW: not wrapped
+            return {};
+        }
+
+        return resolvedModuleWrapped->_module.Get(isolate);
+    }
+
+    static v8::MaybeLocal<v8::Value> _evaluationSteps(
+        v8::Local<v8::Context> context_, v8::Local<v8::Module> module_) {
+        auto env     = EsEnvironment::get(context_);
+        auto isolate = env->isolate();
+
+        auto importerWrapper = env->getModuleWrapper(module_);
+        assert(importerWrapper);
+
+        v8::TryCatch tryCatch{isolate};
+
+        const auto syntheticEvaluationSteps =
+            importerWrapper->object()->GetInternalField(InternalFieldSlots::syntheticEvaluationSteps).As<v8::Function>();
+        const auto evaluationResult = syntheticEvaluationSteps->Call(context_, importerWrapper->object(), 0, nullptr);
+        if (evaluationResult.IsEmpty()) {
+            assert(tryCatch.HasCaught());
+        }
+
+        if (tryCatch.HasCaught() && !tryCatch.HasTerminated()) {
+            assert(!tryCatch.Message().IsEmpty());
+            assert(!tryCatch.Exception().IsEmpty());
+            tryCatch.ReThrow();
+            return v8::MaybeLocal<v8::Value>();
+        }
+
+        return v8::Undefined(isolate);
+    }
+
+    v8::Persistent<v8::Module>                                   _module;
+    v8::Persistent<v8::String>                                   _url;
+    v8::Persistent<v8::Context>                                  _context;
+    std::unordered_map<std::string, v8::Persistent<v8::Promise>> _resolvePromises;
+    bool                                                         _linked = false;
+};
+
+EsEnvironment::EsEnvironment(v8::Local<v8::Context> context_) : _isolate(context_->GetIsolate()), _context(context_->GetIsolate(), context_) {
+    context_->SetAlignedPointerInEmbedderData(ContextEmbedderIndex::environment, this);
+    _external.Reset(_isolate, v8::External::New(_isolate, this));
+    // _isolate->SetPromiseRejectCallback(_onPromiseRejected);
+
+    const auto context = _context.Get(_isolate);
+
+    _moduleWrapTempl.Reset(_isolate, EsModule::createFunctionTemplate(*this));
+
+    const auto moduleWrapConstructor = _moduleWrapTempl.Get(_isolate)->GetFunction(context).ToLocalChecked();
+    _internalBindingModule           = std::make_unique<InternalBindingModule>(context, moduleWrapConstructor);
+}
+
+EsModule *EsEnvironment::getModuleWrapper(v8::Local<v8::Module> module_) {
+    auto range = _hashToModuleMap.equal_range(module_->GetIdentityHash());
+    for (auto i = range.first; i != range.second; ++i) {
+        if (i->second->module(this->_isolate) == module_) {
+            return i->second;
+        }
+    }
+    return nullptr;
+}
+
+template <typename T>
+T &get_native(const v8::FunctionCallbackInfo<v8::Value> &args_) {
+    assert(args_.Data()->IsExternal());
+    return *static_cast<T *>(args_.Data().As<v8::External>()->Value());
+}
+
+void EsEnvironment::startup() {
+    auto isolate = _isolate;
+    auto context = _context.Get(_isolate);
+    auto global  = context->Global();
+
+    auto target = global;
+
+    auto       moduleWrapTempl = _moduleWrapTempl.Get(isolate);
+    const auto moduleWrap      = moduleWrapTempl->GetFunction(context).ToLocalChecked();
+    target->Set(
+              this->context(),
+              v8::String::NewFromUtf8(_isolate, "EsModule").ToLocalChecked(),
+              moduleWrap)
+        .FromJust();
+
+    this->SetMethod(
+        target,
+        "setPromiseRejectCallback",
+        SetPromiseRejectCallback);
+
+    _internalBindingModule->bindings().add(u8R"(ModuleWrap)", moduleWrap, context->GetIsolate());
+
+    _internalBindingModule->bindings().add(u8R"(internalBindingModuleWrap)", _internalBindingModule->module(isolate), isolate);
+
+    _internalBindingModule->bindings().add(
+        u8R"(log)",
+        v8::Function::New(
+            context,
+            [](const v8::FunctionCallbackInfo<v8::Value> &args_) {
+                assert(args_.Length() == 1);
+                assert(args_[0]->IsString());
+                const auto message = v8::String::Utf8Value(args_.GetIsolate(), args_[0]);
+                seLogE("[internalBinding.log] %s\n", *message);
+            },
+            v8::External::New(isolate, this))
+            .ToLocalChecked(),
+        isolate);
+
+    _internalBindingModule->bindings().add(
+        u8R"(getStringFromFile)",
+        v8::Function::New(
+            context,
+            [](const v8::FunctionCallbackInfo<v8::Value> &args_) {
+                assert(args_.Length() == 1);
+                assert(args_[0]->IsString());
+                const auto path   = v8::String::Utf8Value(args_.GetIsolate(), args_[0]);
+                const auto env    = static_cast<EsEnvironment *>(args_.Data().As<v8::External>()->Value());
+                const auto source = env->_fileOperationDelegate.onGetStringFromFile(*path);
+                args_.GetReturnValue().Set(v8::String::NewFromUtf8(args_.GetIsolate(), source.data()).ToLocalChecked());
+            },
+            v8::External::New(isolate, this))
+            .ToLocalChecked(),
+        isolate);
+
+    _internalBindingModule->bindings().add(
+        u8R"(setLoader)",
+        v8::Function::New(
+            context,
+            [](const v8::FunctionCallbackInfo<v8::Value> &args_) {
+                EsEnvironment::get(args_)->_setLoader(args_);
+            },
+            v8::External::New(isolate, this))
+            .ToLocalChecked(),
+        isolate);
+}
 
 namespace {
 ScriptEngine *gSriptEngineInstance = nullptr;
@@ -476,6 +1420,10 @@ bool ScriptEngine::init() {
 
     _context.Reset(_isolate, v8::Context::New(_isolate));
     _context.Get(_isolate)->Enter();
+
+    _environment                         = std::make_unique<EsEnvironment>(_context.Get(_isolate));
+    _environment->_fileOperationDelegate = _fileOperationDelegate;
+    _environment->startup();
 
     NativePtrToObjectMap::init();
     NonRefNativePtrCreatedByCtorMap::init();
@@ -979,6 +1927,17 @@ bool ScriptEngine::runScript(const std::string &path, Value *ret /* = nullptr */
 
     SE_LOGE("ScriptEngine::runScript script %s, buffer is empty!\n", path.c_str());
     return false;
+}
+
+bool ScriptEngine::import(const std::string &specifier_, std::string *parentURL) {
+    this->_environment->import(
+        v8::String::NewFromUtf8(_isolate, specifier_.data()).ToLocalChecked(),
+        !parentURL ? v8::MaybeLocal<v8::String>{} : v8::String::NewFromUtf8(_isolate, specifier_.data()).ToLocalChecked());
+    return true;
+}
+
+void ScriptEngine::runInInternal(const std::string &path_) {
+    this->_environment->runInInternal(path_);
 }
 
 void ScriptEngine::clearException() {

@@ -55,8 +55,11 @@ void CCMTLSwapchain::doInit(const SwapchainInfo &info) {
     _gpuSwapchainObj = CC_NEW(CCMTLGPUSwapChainObject);
 
     //----------------------acquire layer-----------------------------------
-    auto* view = (CCView*)info.windowHandle;
-    CAMetalLayer *layer = static_cast<CAMetalLayer *>(view.layer);
+    CAMetalLayer* layer = (CAMetalLayer*)info.windowHandle;
+//    CAMetalLayer *layer = static_cast<CAMetalLayer *>(view.layer);
+    if(!layer.device) {
+        layer.device = MTLCreateSystemDefaultDevice();
+    }
 
     if (layer.pixelFormat == MTLPixelFormatInvalid) {
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;

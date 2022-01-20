@@ -358,6 +358,8 @@ private:
          */
     bool runByteCodeFile(const std::string &pathBc, Value *ret /* = nullptr */);
     void callExceptionCallback(const char *, const char *, const char *);
+    bool callRegisteredCallback();
+    bool postInit();
 
     std::chrono::steady_clock::time_point _startTime;
     std::vector<RegisterCallback>         _registerCallbackArray;

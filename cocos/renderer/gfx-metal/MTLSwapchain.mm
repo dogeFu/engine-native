@@ -55,15 +55,15 @@ void CCMTLSwapchain::doInit(const SwapchainInfo &info) {
     _gpuSwapchainObj = CC_NEW(CCMTLGPUSwapChainObject);
 
     //----------------------acquire layer-----------------------------------
-    #ifdef CC_EDITOR
-        CAMetalLayer* layer = (CAMetalLayer*)info.windowHandle;
-        if(!layer.device) {
-            layer.device = MTLCreateSystemDefaultDevice();
-        }
-    #else
-         auto* view = (CCView*)info.windowHandle;
-         CAMetalLayer *layer = static_cast<CAMetalLayer *>(view.layer);
-    #endif
+#ifdef CC_EDITOR
+    CAMetalLayer* layer = (CAMetalLayer*)info.windowHandle;
+    if(!layer.device) {
+        layer.device = MTLCreateSystemDefaultDevice();
+    }
+#else
+     auto* view = (CCView*)info.windowHandle;
+     CAMetalLayer *layer = static_cast<CAMetalLayer *>(view.layer);
+#endif
 
     if (layer.pixelFormat == MTLPixelFormatInvalid) {
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;

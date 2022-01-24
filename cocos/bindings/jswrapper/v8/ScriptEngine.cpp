@@ -209,9 +209,6 @@ public:
     #else
         platform = v8::platform::NewDefaultPlatform().release();
         v8::V8::InitializePlatform(platform);
-    #endif // CC_EDITOR
-
-
         std::string flags;
         //NOTICE: spaces are required between flags
         flags.append(" --expose-gc-as=" EXPOSE_GC);
@@ -221,11 +218,12 @@ public:
         flags.append(" --jitless");
     #endif
         if (!flags.empty()) {
-            //v8::V8::SetFlagsFromString(flags.c_str(), static_cast<int>(flags.length()));
+            v8::V8::SetFlagsFromString(flags.c_str(), static_cast<int>(flags.length()));
         }
 
-        //bool ok = v8::V8::Initialize();
-        //assert(ok);
+        bool ok = v8::V8::Initialize();
+        assert(ok);
+    #endif // CC_EDITOR
     }
 
     ~ScriptEngineV8Context() {
@@ -456,6 +454,14 @@ ScriptEngine::ScriptEngine()
 ScriptEngine::~ScriptEngine() = default;
 
 bool ScriptEngine::postInit() {
+    v8::HandleScope hs(_isolate);
+    _isolate->Enter();
+    _isolate->SetCaptureStackTraceForUncaughtExceptions(true, JSB_STACK_FRAME_LIMIT, v8::StackTrace::kOverview);
+    _isolate->SetFatalErrorHandler(onFatalErrorCallback);
+    _isolate->SetOOMErrorHandler(onOOMErrorCallback);
+    _isolate->AddMessageListener(onMessageCallback);
+    _isolate->SetPromiseRejectCallback(onPromiseRejectCallback);
+    
     NativePtrToObjectMap::init();
     Object::setup();
     Class::setIsolate(_isolate);
@@ -531,14 +537,6 @@ bool ScriptEngine::init() {
     createParams.array_buffer_allocator = v8::ArrayBuffer::Allocator::NewDefaultAllocator();
     _isolate                            = v8::Isolate::New(createParams);
 
-    v8::HandleScope hs(_isolate);
-    _isolate->Enter();
-    _isolate->SetCaptureStackTraceForUncaughtExceptions(true, JSB_STACK_FRAME_LIMIT, v8::StackTrace::kOverview);
-    _isolate->SetFatalErrorHandler(onFatalErrorCallback);
-    _isolate->SetOOMErrorHandler(onOOMErrorCallback);
-    _isolate->AddMessageListener(onMessageCallback);
-    _isolate->SetPromiseRejectCallback(onPromiseRejectCallback);
-
     _context.Reset(_isolate, v8::Context::New(_isolate));
     _context.Get(_isolate)->Enter();
     return postInit();
@@ -557,13 +555,6 @@ bool ScriptEngine::init(v8::Isolate *isolate) {
     _beforeInitHookArray.clear();
 
     _isolate = isolate;
-    v8::HandleScope hs(_isolate);
-    _isolate->Enter();
-    _isolate->SetCaptureStackTraceForUncaughtExceptions(true, JSB_STACK_FRAME_LIMIT, v8::StackTrace::kOverview);
-    _isolate->SetFatalErrorHandler(onFatalErrorCallback);
-    _isolate->SetOOMErrorHandler(onOOMErrorCallback);
-    _isolate->AddMessageListener(onMessageCallback);
-    _isolate->SetPromiseRejectCallback(onPromiseRejectCallback);
     
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
     _context.Reset(isolate, context);
@@ -674,6 +665,7 @@ void ScriptEngine::addPermanentRegisterCallback(RegisterCallback cb) {
 }
 
 bool ScriptEngine::callRegisteredCallback() {
+    se::AutoHandleScope hs;
     bool ok    = false;
     _startTime = std::chrono::steady_clock::now();
 
@@ -703,8 +695,6 @@ bool ScriptEngine::start() {
     if (!init()) {
         return false;
     }
-    se::AutoHandleScope hs;
-
     // debugger
     if (isDebuggerEnabled()) {
     #if SE_ENABLE_INSPECTOR
@@ -729,7 +719,6 @@ bool ScriptEngine::start(v8::Isolate *isolate) {
     if (!init(isolate)) {
         return false;
     }
-    se::AutoHandleScope hs;
     return callRegisteredCallback();
 }
 
